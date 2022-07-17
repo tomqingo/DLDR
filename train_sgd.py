@@ -2,9 +2,6 @@ import argparse
 import os
 import shutil
 import time
-import numpy as np
-import pickle
-import random
 
 import torch
 import torch.nn as nn
@@ -13,26 +10,43 @@ import torch.backends.cudnn as cudnn
 import torch.optim
 import torch.utils.data
 import torchvision.transforms as transforms
-import torchvision.datasets as datasets
-
+#import torchvision.datasets as datasets
+import cifardataset as datasets
 import resnet
-from utils import get_datasets, get_model
+import convNet
+import random
 
-# Parse arguments
-parser = argparse.ArgumentParser(description='Regular training and sampling for DLDR')
-parser.add_argument('--arch', '-a', metavar='ARCH',
-                    help='The architecture of the model')
-parser.add_argument('--datasets', metavar='DATASETS', default='CIFAR10', type=str,
-                    help='The training datasets')
-parser.add_argument('--optimizer',  metavar='OPTIMIZER', default='sgd', type=str,
-                    help='The optimizer for training')
+import numpy as np
+import pickle
+import pdb
+import scipy.io as io
+
+
+
+model_names = sorted(name for name in resnet.__dict__
+    if name.islower() and not name.startswith("__")
+                     and (name.startswith("resnet"))
+                     and callable(resnet.__dict__[name]))
+model_names.append('convnet')
+
+parser = argparse.ArgumentParser(description='Propert ResNets for CIFAR10 in pytorch')
+parser.add_argument('--arch', '-a', metavar='ARCH', default='resnet32',
+                    choices=model_names,
+                    help='model architecture: ' + ' | '.join(model_names) +
+                    ' (default: resnet32)')
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
-parser.add_argument('--epochs', default=200, type=int, metavar='N',
+parser.add_argument('--epochs', default=150, type=int, metavar='N',
                     help='number of total epochs to run')
-parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
+parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=128, type=int,
+parser.add_argument('-c', '--num_class', default=10, type=int,
+                    metavar='N', help='num of classes (default: 10)')
+parser.add_argument('--sample', default=False, type=bool,
+                    metavar='B', help='whether to sample from data')
+parser.add_argument('-k', '--k_shot', default=10, type=int,
+                    metavar='N', help='sample per class')
+parser.add_argument('-b', '--batch_size', default=128, type=int,
                     metavar='N', help='mini-batch size (default: 128)')
 parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
                     metavar='LR', help='initial learning rate')
@@ -41,7 +55,7 @@ parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
 parser.add_argument('--weight-decay', '--wd', default=1e-4, type=float,
                     metavar='W', help='weight decay (default: 1e-4)')
 parser.add_argument('--print-freq', '-p', default=50, type=int,
-                    metavar='N', help='print frequency (default: 50 iterations)')
+                    metavar='N', help='print frequency (default: 50)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
@@ -57,13 +71,8 @@ parser.add_argument('--save-every', dest='save_every',
                     help='Saves checkpoints at every specified number of epochs',
                     type=int, default=10)
 parser.add_argument('--randomseed', 
-                    help='Randomseed for training and initialization',
+                    help='randomseed',
                     type=int, default=1)
-parser.add_argument('--corrupt', default=0, type=float,
-                    metavar='c', help='noise level for training set')
-parser.add_argument('--smalldatasets', default=None, type=float, dest='smalldatasets', 
-                    help='percent of small datasets')
-            
 best_prec1 = 0
 
 def set_seed(seed=1): 
@@ -74,38 +83,56 @@ def set_seed(seed=1):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-# Record training statistics
+# f = open('./save_resnet20/feature_vec.txt','rb')  
+# feature_data = pickle.load(f) 
+# print (feature_data.shape)
+# f.close()
+
+param_vec = []
 train_loss = []
 train_err = []
 test_loss = []
 test_err = []
-arr_time = []
 
 def main():
 
     global args, best_prec1
-    global param_avg, train_loss, train_err, test_loss, test_err, arr_time
-    
+    global param_vec, train_loss, train_err, test_loss, test_err
     args = parser.parse_args()
     
-    set_seed(args.randomseed)
 
 
     # Check the save_dir exists or not
-    print (args.save_dir)
     if not os.path.exists(args.save_dir):
         os.makedirs(args.save_dir)
 
-    # Define model
-    model = torch.nn.DataParallel(get_model(args))
-    model.cuda()
 
-    # Optionally resume from a checkpoint
+    # randomly select the samples
+    classall = list(range(10))
+    if args.num_class<10:
+        random.shuffle(classall)
+    classselect = classall[0:args.num_class]
+    #io.savemat('./'+args.save_dir+'/classselect.mat', mdict={'classselect':classselect})
+    #print(classselect)
+
+    set_seed(args.randomseed)
+    if 'convnet' in args.arch:
+        model = convNet.convnet(args.num_class)
+    elif 'resnet' in args.arch:
+        model = resnet.__dict__[args.arch](args.num_class)
+    model.cuda()
+    #pdb.set_trace()
+    
+    # optionally resume from a checkpoint
     if args.resume:
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
             checkpoint = torch.load(args.resume)
             args.start_epoch = checkpoint['epoch']
+
+            print (args.start_epoch)
+            #args.start_epoch = 81
+
             print ('from ', args.start_epoch)
             best_prec1 = checkpoint['best_prec1']
             model.load_state_dict(checkpoint['state_dict'])
@@ -116,10 +143,29 @@ def main():
 
     cudnn.benchmark = True
 
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
 
-    # Prepare Dataloader
-    train_loader, val_loader = get_datasets(args)
+    train_dataset =  datasets.CIFAR10SUB(root='/home/datasets/CIFAR10', classselect=classselect, train=True, transform=transforms.Compose([
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomCrop(32, 4),
+            transforms.ToTensor(),
+            normalize,
+        ]), download=True, sample=args.sample, samplenum=args.k_shot)
+    val_dataset = datasets.CIFAR10SUB(root='/home/datasets/CIFAR10', classselect=classselect, train=False, transform=transforms.Compose([
+            transforms.ToTensor(),
+            normalize,
+        ]))
+    
+    train_loader = torch.utils.data.DataLoader(train_dataset,
+        batch_size=args.batch_size, shuffle=True,
+        num_workers=args.workers, pin_memory=True)
 
+    val_loader = torch.utils.data.DataLoader(val_dataset,
+        batch_size=128, shuffle=False,
+        num_workers=args.workers, pin_memory=True)
+
+    # pdb.set_trace()
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda()
 
@@ -127,22 +173,15 @@ def main():
         model.half()
         criterion.half()
 
-    if args.optimizer == 'sgd':
-        optimizer = torch.optim.SGD(model.parameters(), args.lr,
-                                    momentum=args.momentum,
-                                    weight_decay=args.weight_decay)
-    elif args.optimizer == 'adam':
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=args.weight_decay)
+    optimizer = torch.optim.SGD(model.parameters(), args.lr,
+                                momentum=args.momentum,
+                                weight_decay=args.weight_decay)
     
-    ##################################################################################################
-    
-    if args.datasets == 'CIFAR10':
-        lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
-                                                            milestones=[100, 150], last_epoch=args.start_epoch - 1)
-                                                            
-    elif args.datasets == 'CIFAR100':
-        lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
-                                                            milestones=[150], last_epoch=args.start_epoch - 1)
+    # optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=args.weight_decay)
+
+    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
+                                                        milestones=[100])
+    lr_scheduler.last_epoch=args.start_epoch - 1
 
     if args.arch in ['resnet1202', 'resnet110']:
         # for resnet1202 original paper uses lr=0.01 for first 400 minibatches for warm-up
@@ -155,6 +194,7 @@ def main():
         validate(val_loader, model, criterion)
         return
 
+    param_vec.append(get_model_param_vec(model))
     is_best = 0
     save_checkpoint({
         'epoch': 0,
@@ -162,11 +202,9 @@ def main():
         'best_prec1': best_prec1,
     }, is_best, filename=os.path.join(args.save_dir, 'checkpoint_refine_' + str(0) + '.th'))
 
-    print ('Start training: ', args.start_epoch, '->', args.epochs)
+    print ((args.start_epoch, args.epochs))
 
-    # DLDR sampling
-    torch.save(model.state_dict(), os.path.join(args.save_dir,  str(0) +  '.pt'))
-
+    test_acc_col = []
     for epoch in range(args.start_epoch, args.epochs):
 
         # train for one epoch
@@ -181,44 +219,89 @@ def main():
         is_best = prec1 > best_prec1
         best_prec1 = max(prec1, best_prec1)
 
-        if epoch > 0 and epoch % args.save_every == 0 or epoch == args.epochs - 1:
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'state_dict': model.state_dict(),
-                'best_prec1': best_prec1,
-            }, is_best, filename=os.path.join(args.save_dir, 'checkpoint_refine_' + str(epoch+1) + '.th'))
+        # if epoch > 0 and epoch % args.save_every == 0 or epoch == args.epochs - 1:
+        # if epoch % 10 == 9 or epoch == args.epochs - 1:
+        #     save_checkpoint({
+        #         'epoch': epoch + 1,
+        #         'state_dict': model.state_dict(),
+        #         'best_prec1': best_prec1,
+        #     }, is_best, filename=os.path.join(args.save_dir, 'checkpoint_refine_' + str(epoch+1) + '.th'))
 
         save_checkpoint({
             'state_dict': model.state_dict(),
             'best_prec1': best_prec1,
         }, is_best, filename=os.path.join(args.save_dir, 'model.th'))
 
-        # DLDR sampling
-        torch.save(model.state_dict(), os.path.join(args.save_dir,  str(epoch + 1) +  '.pt'))
+        print(len(get_model_param_vec(model)))
+        if epoch < 101:
+            param_vec.append(get_model_param_vec(model))
+        
+        test_acc_col.append(prec1)
+        # if (epoch >= 50):
+        #     param_vec.append(get_model_param_vec(model))
+    
+
+    param_data = np.array(param_vec)
+    print (param_data.shape)
+
+    selectclass = train_dataset.class_to_idx
+    with open('./'+args.save_dir+'/param_data_100.txt', 'wb') as file:
+        pickle.dump(param_data, file)
+    with open('./'+args.save_dir+'/classcategory.txt', 'wb') as file:
+        pickle.dump(selectclass, file)
+    
+    io.savemat('./'+args.save_dir+'/testaccorg.mat', mdict={'testaccorg':test_acc_col})
+
+    print ('Done!')
 
     print ('train loss: ', train_loss)
     print ('train err: ', train_err)
     print ('test loss: ', test_loss)
     print ('test err: ', test_err)
 
-    print ('time: ', arr_time)
 
 
 def get_model_param_vec(model):
-    """
-    Return model parameters as a vector
-    """
     vec = []
     for name,param in model.named_parameters():
-        vec.append(param.detach().cpu().numpy().reshape(-1))
-    return np.concatenate(vec, 0)
+        vec += list(param.detach().cpu().reshape(-1))
+    return vec
+
+def get_model_grad_vec(model):
+    vec = []
+    for name,param in model.named_parameters():
+        vec += list(param.grad.detach().cpu().reshape(-1))
+    return vec
+
+def update_grad(model, grad_vec):
+    idx = 0
+    for name,param in model.named_parameters():
+        arr_shape = param.grad.shape
+        size = 1
+        for i in range(len(list(arr_shape))):
+            size *= arr_shape[i]
+        param.grad = torch.from_numpy(grad_vec[idx:idx+size].reshape(arr_shape)).to(device).float()
+        idx += size
+        assert param.grad.shape == arr_shape
+
+def project(vec, feature_data):
+    vec = np.array(vec)
+    new_vec = np.zeros(vec.shape)
+    for i in range(feature_data.shape[0]):
+        projection = np.dot(vec, feature_data[i, :])
+        new_vec += projection * feature_data[i, :]
+    # print (np.dot(new_vec, vec) / np.linalg.norm(new_vec) / np.linalg.norm(vec))
+    # print (np.linalg.norm(feature_data[i,:])) 
+    return new_vec
+
+
 
 def train(train_loader, model, criterion, optimizer, epoch):
     """
-    Run one train epoch
+        Run one train epoch
     """
-    global train_loss, train_err, arr_time
-    
+    global param_vec
+    global train_loss, train_err
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -250,19 +333,29 @@ def train(train_loader, model, criterion, optimizer, epoch):
         total_loss += loss.item() * input_var.shape[0]
         total_err += (output.max(dim=1)[1] != target_var).sum().item()
 
+        # project grad vectors into feature spaces
+        # grad_vec = project(get_model_grad_vec(model), feature_data)
+        # update_grad(model, grad_vec)
+
         optimizer.step()
+
         output = output.float()
         loss = loss.float()
-
         # measure accuracy and record loss
         prec1 = accuracy(output.data, target)[0]
         losses.update(loss.item(), input.size(0))
         top1.update(prec1.item(), input.size(0))
 
+
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
 
+        # if  i == 190:
+        #     param_vec.append(get_model_param_vec(model))
+
+        #print(target_var)
+        
         if i % args.print_freq == 0:
             print('Epoch: [{0}][{1}/{2}]\t'
                   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
@@ -271,12 +364,16 @@ def train(train_loader, model, criterion, optimizer, epoch):
                   'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
                       epoch, i, len(train_loader), batch_time=batch_time,
                       data_time=data_time, loss=losses, top1=top1))
-
-    print ('Total time for epoch [{0}] : {1:.3f}'.format(epoch, batch_time.sum))
+        
+        #if i==args.print_freq:
+        #    pdb.set_trace()
+        #if i == 0:
+        # print(target_var)
+        #break
 
     train_loss.append(total_loss / len(train_loader.dataset))
     train_err.append(total_err / len(train_loader.dataset)) 
-    arr_time.append(batch_time.sum)
+
 
 def validate(val_loader, model, criterion):
     """
